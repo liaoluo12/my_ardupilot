@@ -152,6 +152,11 @@ Mode *Copter::mode_from_mode_num(const Mode::Number mode)
             return &mode_turtle;
 #endif
 
+#if MODE_AUTO_DRAW_ENABLED
+        case Mode::Number::AUTO_DRAW:
+            return &mode_autodraw;
+#endif
+
         default:
             break;
     }

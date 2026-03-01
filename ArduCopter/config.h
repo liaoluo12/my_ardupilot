@@ -132,6 +132,10 @@
 # define MODE_ACRO_ENABLED 1
 #endif
 
+#ifndef MODE_AUTO_DRAW_ENABLED
+# define MODE_AUTO_DRAW_ENABLED 1
+#endif
+
 //////////////////////////////////////////////////////////////////////////////
 // Auto mode - allows vehicle to trace waypoints and perform automated actions
 #ifndef MODE_AUTO_ENABLED

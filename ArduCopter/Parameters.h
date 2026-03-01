@@ -564,6 +564,8 @@ public:
     // Additional pilot velocity items
     AP_Int16    pilot_speed_dn_cms;
 
+    AP_Float star_radius_cm;        // 新增
+
 #if TOY_MODE_ENABLED
     ToyMode toy_mode;
 #endif

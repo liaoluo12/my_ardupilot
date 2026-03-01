@@ -101,6 +101,7 @@ public:
         AUTOROTATE =   26,  // Autonomous autorotation
         AUTO_RTL =     27,  // Auto RTL, this is not a true mode, AUTO will report as this mode if entered to perform a DO_LAND_START Landing sequence
         TURTLE =       28,  // Flip over after crash
+        AUTO_DRAW=     29,  // 新增：Auto Draw mode
 
         // Mode number 30 reserved for "offboard" for external/lua control.
 
@@ -2152,3 +2153,38 @@ private:
 
 };
 #endif
+
+// 新增代码：自定义飞行模式类 ModeAutoDraw，继承自 Mode
+class ModeAutoDraw : public Mode {
+
+public:
+    // 继承构造函数
+    using Mode::Mode;
+    Number mode_number() const override { return Number::AUTO_DRAW; }   //新增 hangao
+
+    // 初始化和主运行函数
+    bool init(bool ignore_checks) override;
+    void run() override;
+
+    // 模式属性设置
+    bool requires_position() const override { return true; }
+    bool has_manual_throttle() const override { return false; }
+    bool allows_arming(AP_Arming::Method method) const override { return false; }
+    bool is_autopilot() const override { return true; }
+    bool in_guided_mode() const override { return true; }
+    bool has_user_takeoff(bool must_navigate) const override { return false; }
+
+protected:
+    const char *name() const override { return "DRAWSTAR"; }
+    const char *name4() const override { return "DRAWSTAR"; }
+
+private:
+    // 新增：飞机名称缓存
+    char _aircraft_name[32];
+    Vector3f path[10];      // 存储星形路线的航点
+    int path_num;           // 当前航点索引
+
+    void generate_path();   // 生成星形路径
+    void pos_control_start(); // 启动位置控制
+    void pos_control_run();   // 执行位置控制
+};

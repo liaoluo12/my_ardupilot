@@ -204,6 +204,7 @@ public:
     friend class ModeAcro;
     friend class ModeAcro_Heli;
     friend class ModeAltHold;
+    friend class ModeAutoDraw;    // 新增：创建自动 draw 飞行模式对象
     friend class ModeAuto;
     friend class ModeAutoTune;
     friend class ModeAvoidADSB;
@@ -1030,6 +1031,11 @@ private:
 #endif
 #endif
     ModeAltHold mode_althold;
+
+#if MODE_AUTO_DRAW_ENABLED
+    ModeAutoDraw mode_autodraw;    // 新增：创建自动 draw 飞行模式对象
+#endif
+
 #if MODE_AUTO_ENABLED
     ModeAuto mode_auto;
 #endif
