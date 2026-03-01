@@ -1,9 +1,9 @@
 #include "Copter.h"
 #include <AP_Filesystem/AP_Filesystem.h>
+#include <cmath>            // sinf / cosf / radians
 #include <cstdio>
 #include <cstring>
 #include <errno.h>
-#include <AP_GPS/AP_GPS.h>
 #include <AP_GPS/AP_GPS.h>
 #if AP_SIM_ENABLED
 #include <SITL/SITL.h>
@@ -22,48 +22,58 @@ extern const AP_HAL::HAL& hal;
 // 新增代码 hangoa
 bool ModeAutoDraw::init(bool ignore_checks)
 {
-    // 检查位置估算是否正常或者是否忽略检查
-    if (copter.position_ok() || ignore_checks) {
-        // 初始化偏航角（Yaw）模式为默认
-        auto_yaw.set_mode_to_default(false);
+    // clear name and reset index again in case object was reused
+    _aircraft_name[0] = '\0';
+    path_num = 0;
 
-        // 重置路径索引并生成星形路径
-        path_num = 0;
-        generate_path();
-        
-        // 新增：读取飞机名称
-        // _aircraft_name[0] = '\0';
-        // const int name_fd = AP::FS().open("autodraw_name.txt", O_RDONLY, true);
-        // if (name_fd != -1) {
-        //     gcs().send_text(MAV_SEVERITY_INFO, "read autodraw_name.txt");
-        //     char line[64];
-        //     if (AP::FS().fgets(line, sizeof(line) - 1, name_fd)) {
-        //         line[sizeof(line) - 1] = '\0';
-        //         const size_t len = strcspn(line, "\r\n");
-        //         line[len] = '\0';
-        //         strncpy(_aircraft_name, line, sizeof(_aircraft_name) - 1);
-        //         _aircraft_name[sizeof(_aircraft_name) - 1] = '\0';
-        //     }
-        //     AP::FS().close(name_fd);
-        // }
-
-        // 启动位置控制模式
-        pos_control_start();
-        return true;
-    }else{
-        return false;
+    // 不再阻止模式切换：即便 GPS 还没准备好也继续进入，该模式在内部自行处理
+    if (!ignore_checks && !copter.position_ok()) {
+        gcs().send_text(MAV_SEVERITY_WARNING, "ModeAutoDraw: GPS not ready, ignoring checks");
     }
+
+    // 初始化偏航角（Yaw）模式为默认
+    auto_yaw.set_mode_to_default(false);
+
+    // 生成星形路径
+    generate_path();
+
+    // optional: read aircraft name from file if available
+    const int name_fd = AP::FS().open("autodraw_name.txt", O_RDONLY, true);
+    if (name_fd != -1) {
+        gcs().send_text(MAV_SEVERITY_INFO, "read autodraw_name.txt");
+        char line[sizeof(_aircraft_name)];
+        if (AP::FS().fgets(line, sizeof(line) - 1, name_fd)) {
+            line[sizeof(line) - 1] = '\0';
+            const size_t len = strcspn(line, "\r\n");
+            line[len] = '\0';
+            strncpy(_aircraft_name, line, sizeof(_aircraft_name) - 1);
+            _aircraft_name[sizeof(_aircraft_name) - 1] = '\0';
+        }
+        AP::FS().close(name_fd);
+    }
+
+    // 启动位置控制模式
+    pos_control_start();
+    return true;
 }
 
 // ModeAutoDraw::generate_path - 生成星形路径的 7 个关键点（含起点）
 // 新增代码
 void ModeAutoDraw::generate_path()
 {
-    // 从参数中获取星形半径
+    // 从参数中获取星形半径（参数可能还没加载，防止为 0）
     float radius_cm = g2.star_radius_cm;
+    if (radius_cm <= 0.0f) {
+        // 使用默认半径 10m
+        radius_cm = 1000.0f;
+    }
 
     Vector3f stopping_point_neu_cm;
-    wp_nav->get_wp_stopping_point_NEU_cm(stopping_point_neu_cm);
+    if (wp_nav) {
+        wp_nav->get_wp_stopping_point_NEU_cm(stopping_point_neu_cm);
+    } else {
+        stopping_point_neu_cm.zero();
+    }
     path[0] = stopping_point_neu_cm;
 
     // 基于三角函数计算星形五个顶点的相对位置
@@ -80,10 +90,11 @@ void ModeAutoDraw::generate_path()
 void ModeAutoDraw::pos_control_start()
 {
     // 初始化路点和样条控制器
-    wp_nav->wp_and_spline_init_m();
-
-    // 设置第一个目标点为起始点
-    wp_nav->set_wp_destination_NEU_cm(path[0], false);
+    if (wp_nav) {
+        wp_nav->wp_and_spline_init_m();
+        // 设置第一个目标点为起始点
+        wp_nav->set_wp_destination_NEU_cm(path[0], false);
+    }
 
     // 再次确保偏航角模式正确
     auto_yaw.set_mode_to_default(false);
@@ -120,12 +131,14 @@ void ModeAutoDraw::run()
     }
     
     // 如果还没飞完所有 6 段路径
-    if(path_num < 6){
+    if (wp_nav && path_num < 6) {
         // 检查是否到达当前目标路点
-        if(wp_nav->reached_wp_destination()){
+        if (wp_nav->reached_wp_destination()) {
             // 索引增加并指向下一个星形顶点
-            path_num ++;
-            wp_nav->set_wp_destination_NEU_cm(path[path_num], false);
+            path_num++;
+            if (path_num <= 6) {
+                wp_nav->set_wp_destination_NEU_cm(path[path_num], false);
+            }
         }
     }
 
@@ -135,10 +148,10 @@ void ModeAutoDraw::run()
 
 // ModeAutoDraw::pos_control_run - 执行底层的位置控制逻辑
 // 新增代码
-void ModeAutoDraw::pos_control_run()    
+void ModeAutoDraw::pos_control_run()
 {
     // 飞行安全检查：如果未解锁、未自动解锁、电机锁定或着陆已完成，则重置油门并退出
-    if (!motors->armed() || !copter.ap.auto_armed || !motors->get_interlock() || copter.ap.land_complete) {
+    if (!motors || !motors->armed() || !copter.ap.auto_armed || !motors->get_interlock() || copter.ap.land_complete) {
         zero_throttle_and_relax_ac();
         return;
     }
@@ -155,17 +168,25 @@ void ModeAutoDraw::pos_control_run()
     }
 
     // 设置电机状态为全范围
-    motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+    if (motors) {
+        motors->set_desired_spool_state(AP_Motors::DesiredSpoolState::THROTTLE_UNLIMITED);
+    }
 
     // 更新路点导航控制器，并处理地形失效保护
-    copter.failsafe_terrain_set_status(wp_nav->update_wpnav());
+    if (wp_nav) {
+        copter.failsafe_terrain_set_status(wp_nav->update_wpnav());
+    }
 
     // 更新 Z 轴（高度）位置控制器
-    pos_control->D_update_controller();
+    if (pos_control) {
+        pos_control->D_update_controller();
+    }
 
     // 根据偏航模式调用姿态控制器
-    attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_rad(
-        wp_nav->get_roll_rad(),
-        wp_nav->get_pitch_rad(),
-        target_yaw_rate_rads);
+    if (attitude_control && wp_nav) {
+        attitude_control->input_euler_angle_roll_pitch_euler_rate_yaw_rad(
+            wp_nav->get_roll_rad(),
+            wp_nav->get_pitch_rad(),
+            target_yaw_rate_rads);
+    }
 }

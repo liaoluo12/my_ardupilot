@@ -2154,20 +2154,21 @@ private:
 };
 #endif
 
-// 新增代码：自定义飞行模式类 ModeAutoDraw，继承自 Mode
+// 新增：自定义飞行模式类 ModeAutoDraw，继承自 Mode
 class ModeAutoDraw : public Mode {
 
 public:
     // 继承构造函数
     using Mode::Mode;
-    Number mode_number() const override { return Number::AUTO_DRAW; }   //新增 hangao
+    Number mode_number() const override { return Number::AUTO_DRAW; }   
 
     // 初始化和主运行函数
     bool init(bool ignore_checks) override;
     void run() override;
 
     // 模式属性设置
-    bool requires_position() const override { return true; }
+    // 该模式不依赖 GPS/位置检查，以便快速切换
+    bool requires_position() const override { return false; }
     bool has_manual_throttle() const override { return false; }
     bool allows_arming(AP_Arming::Method method) const override { return false; }
     bool is_autopilot() const override { return true; }
@@ -2179,10 +2180,13 @@ protected:
     const char *name4() const override { return "DRAWSTAR"; }
 
 private:
-    // 新增：飞机名称缓存
-    char _aircraft_name[32];
+
+    // name string used for logging; must be null-terminated.
+    // initialize here to avoid uninitialised memory causing
+    // flow-of-control internal errors when formatting messages.
+    char _aircraft_name[32] = {0};
     Vector3f path[10];      // 存储星形路线的航点
-    int path_num;           // 当前航点索引
+    int path_num = 0;           // 当前航点索引 (reset in init() too)
 
     void generate_path();   // 生成星形路径
     void pos_control_start(); // 启动位置控制

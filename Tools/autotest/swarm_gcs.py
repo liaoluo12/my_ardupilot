@@ -14,7 +14,12 @@ try:
 except ImportError:
     HAS_FTP = False
 
-DEFAULT_WAYPACK_PATH = "/home/han/ardupilot/Tools/autotest/waypack.txt"
+DEFAULT_WAYPACK_PATH = os.path.join(os.path.dirname(__file__), 'waypack.txt')
+# 可配置参数
+CONNECT_TIMEOUT = 5
+CONNECT_RETRIES = 3
+# 日志文件（追加）
+LOG_PATH = os.path.join(os.path.dirname(__file__), 'swarm_gcs.log')
 
 def load_default_config_from_file():
     paths_to_check = ["waypack.txt", DEFAULT_WAYPACK_PATH]
@@ -46,7 +51,7 @@ def _connect_one_drone(sysid, conn_str, log):
     """Helper function to connect to a single drone."""
     log(f"正在连接无人机 {sysid} ({conn_str})...")
     drone = DroneInstance(sysid, conn_str)
-    if drone.connect():
+    if drone.connect(timeout=CONNECT_TIMEOUT):
         log(f"无人机 {sysid} 连接成功。")
         return sysid, drone
     else:
@@ -134,32 +139,55 @@ class DroneInstance:
         }
 
     def connect(self, timeout=5):
-        try:
-            self.master = mavutil.mavlink_connection(self.connection_string, source_system=255)
-            hb = None
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                msg = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
-                if msg and msg.get_srcSystem() == self.sysid:
-                    hb = msg
-                    break
-            if hb is None:
-                self.connected = False
-                return False
-            self.master.target_system = self.sysid
-            self.master.target_component = 1
-            self.data["last_heartbeat"] = time.time()
-            self.connected = True
-            if HAS_FTP:
+        # 尝试连接并接受任意来源的 heartbeat；将检测到的 srcSystem 作为实际 sysid（兼容 MAVProxy 转发）
+        attempt = 0
+        while attempt < CONNECT_RETRIES:
+            attempt += 1
+            try:
+                self.master = mavutil.mavlink_connection(self.connection_string, source_system=255)
+                hb = None
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    msg = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=1)
+                    if msg:
+                        # 接受第一个收到的 heartbeat，并使用其 srcSystem 作为真实 sysid
+                        try:
+                            src = msg.get_srcSystem()
+                        except Exception:
+                            src = None
+                        if src is not None:
+                            self.sysid = src
+                            hb = msg
+                            break
+                if hb is None:
+                    try:
+                        self.master.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.5)
+                    continue
+
+                # 使用检测到的 sysid 设置目标
+                self.master.target_system = self.sysid
+                self.master.target_component = 1
+                self.data["last_heartbeat"] = time.time()
+                self.connected = True
+                if HAS_FTP:
+                    try:
+                        self.ftp_master = FilteredMaster(self.master, self.sysid)
+                        self.ftp = mavftp.MAVFTP(self.ftp_master, self.sysid, 1)
+                    except Exception as e:
+                        print(f"FTP init failed for {self.sysid}: {e}")
+                return True
+            except Exception as e:
+                print(f"Error connecting to drone {self.sysid} (attempt {attempt}): {e}")
                 try:
-                    self.ftp_master = FilteredMaster(self.master, self.sysid)
-                    self.ftp = mavftp.MAVFTP(self.ftp_master, self.sysid, 1)
-                except Exception as e:
-                    print(f"FTP init failed for {self.sysid}: {e}")
-            return True
-        except Exception as e:
-            print(f"Error connecting to drone {self.sysid}: {e}")
-            return False
+                    if self.master:
+                        self.master.close()
+                except Exception:
+                    pass
+                time.sleep(0.5)
+        return False
 
 class FilteredMaster:
     def __init__(self, master, sysid):
@@ -289,6 +317,12 @@ class SwarmGCSApp:
         self.drones = {}  # sysid -> DroneInstance
         self.drone_configs = {} # sysid -> connection_string
         self.running = True
+        # 打开日志文件（追加），行缓冲
+        try:
+            self.log_file = open(LOG_PATH, 'a', buffering=1, encoding='utf-8')
+            self.log(f"日志文件打开: {LOG_PATH}")
+        except Exception:
+            self.log_file = None
         
         self.setup_ui()
         self.start_mavlink_thread()
@@ -412,6 +446,13 @@ class SwarmGCSApp:
         timestamp = time.strftime("%H:%M:%S", time.localtime())
         self.log_text.insert('end', f"[{timestamp}] {message}\n")
         self.log_text.see('end')
+        # 也写入文件日志（若已打开）
+        try:
+            if hasattr(self, 'log_file') and self.log_file:
+                self.log_file.write(f"[{timestamp}] {message}\n")
+                self.log_file.flush()
+        except Exception:
+            pass
 
     def open_network_settings(self):
         NetworkConfigDialog(self.root, self.drone_configs, self.update_drone_configs)
@@ -469,7 +510,7 @@ class SwarmGCSApp:
             
             log_async(f"正在连接无人机 {sysid} ({conn_str})...")
             drone = DroneInstance(sysid, conn_str)
-            if not drone.connect():
+            if not drone.connect(timeout=CONNECT_TIMEOUT):
                 log_async(f"无人机 {sysid} 连接失败或未收到心跳。")
                 return sysid, None, False, None, None
 
@@ -703,15 +744,38 @@ class SwarmGCSApp:
 
                 values = (sysid, group_name, group_no, status, pos, alt, bat, mode)
                 
-                if self.tree.exists(sysid):
-                    self.tree.item(sysid, values=values)
+                sid = str(sysid)
+                if self.tree.exists(sid):
+                    self.tree.item(sid, values=values)
                 else:
-                    self.tree.insert('', 'end', iid=sysid, values=values)
+                    self.tree.insert('', 'end', iid=sid, values=values)
         
         self.root.after(500, self.update_ui)
 
     def on_close(self):
+        # 先停止循环
         self.running = False
+        # 关闭所有 mavlink 连接和 FTP
+        for sysid, drone in list(self.drones.items()):
+            try:
+                if drone.ftp:
+                    try:
+                        drone.ftp.close()
+                    except Exception:
+                        pass
+                if drone.master:
+                    try:
+                        drone.master.close()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        # 关闭日志文件
+        try:
+            if hasattr(self, 'log_file') and self.log_file:
+                self.log_file.close()
+        except Exception:
+            pass
         self.root.destroy()
     
     def start_multisync_auto(self):
