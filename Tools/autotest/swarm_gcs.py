@@ -5,16 +5,12 @@ import time
 import os
 import sys
 import argparse
-import re
 import concurrent.futures
 from pymavlink import mavutil
-try:
-    from pymavlink import mavftp
-    HAS_FTP = True
-except ImportError:
-    HAS_FTP = False
+# FTP not needed in this simplified GCS
+HAS_FTP = False
 
-DEFAULT_WAYPACK_PATH = "/home/han/ardupilot/Tools/autotest/waypack.txt"
+DEFAULT_WAYPACK_PATH = "/home/liaoluo/ardupilot/Tools/autotest/waypack.txt"
 
 def load_default_config_from_file():
     paths_to_check = ["waypack.txt", DEFAULT_WAYPACK_PATH]
@@ -65,53 +61,8 @@ def connect_drones(drone_configs, log, max_workers=10):
                 
     return drones
 
-def read_files_via_ftp(drones, filename, log):
-    if not HAS_FTP:
-        log("错误: 未检测到 pymavlink.mavftp 模块，FTP功能不可用。")
-        return {}
-    results = {}
-    for sysid, drone in drones.items():
-        if not drone.connected or not drone.ftp:
-            log(f"[FTP] 无人机 {sysid} 未连接或FTP未初始化。")
-            continue
-        try:
-            content = ftp_read_file(drone, sysid, filename, log)
-            results[sysid] = content
-            log(f"[无人机 {sysid} 返回内容]:\n{content}")
-        except Exception as e:
-            log(f"[FTP] 无人机 {sysid} 读取失败: {e}")
-    return results
 
-def build_candidate_paths(filename, sysid):
-    candidates = []
-    candidates.append(filename)
-    if not filename.startswith("/"):
-        candidates.append("/" + filename)
-    candidates.append("APM/" + filename)
-    candidates.append("APM/Log/" + filename)
-    root, ext = os.path.splitext(filename)
-    candidates.append(f"{root}_{sysid}{ext}")
-    return candidates
 
-def ftp_read_file(drone, sysid, filename, log):
-    last_error = None
-    for path in build_candidate_paths(filename, sysid):
-        log(f"[FTP] 正在从无人机 {sysid} 读取 {path} ...")
-        try:
-            with drone.lock:
-                drone.ftp.cmd_get([path, "._tmp"])
-                result = drone.ftp.process_ftp_reply("OpenFileRO", timeout=8)
-                data = drone.ftp.get_result
-            if data is None:
-                last_error = RuntimeError(f"FTP读取失败: {result.return_code}")
-                continue
-            return data.decode("utf-8", errors="replace")
-        except Exception as e:
-            last_error = e
-            continue
-    if last_error:
-        raise last_error
-    raise RuntimeError("FTP读取失败")
 
 class DroneInstance:
     def __init__(self, sysid, connection_string):
@@ -150,39 +101,11 @@ class DroneInstance:
             self.master.target_component = 1
             self.data["last_heartbeat"] = time.time()
             self.connected = True
-            if HAS_FTP:
-                try:
-                    self.ftp_master = FilteredMaster(self.master, self.sysid)
-                    self.ftp = mavftp.MAVFTP(self.ftp_master, self.sysid, 1)
-                except Exception as e:
-                    print(f"FTP init failed for {self.sysid}: {e}")
             return True
         except Exception as e:
             print(f"Error connecting to drone {self.sysid}: {e}")
             return False
 
-class FilteredMaster:
-    def __init__(self, master, sysid):
-        self._master = master
-        self._sysid = sysid
-
-    def recv_match(self, *args, **kwargs):
-        timeout = kwargs.get("timeout", None)
-        deadline = None
-        if timeout is not None:
-            deadline = time.time() + timeout
-        while True:
-            msg = self._master.recv_match(*args, **kwargs)
-            if msg is None:
-                return None
-            src = msg.get_srcSystem()
-            if src == self._sysid:
-                return msg
-            if deadline is not None and time.time() > deadline:
-                return None
-
-    def __getattr__(self, name):
-        return getattr(self._master, name)
 
 class NetworkConfigDialog:
     def __init__(self, parent, drone_configs, on_save):
@@ -297,15 +220,7 @@ class SwarmGCSApp:
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill='both', expand=True, padx=5, pady=5)
 
-        # Tabs
-        self.tab_command = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_command, text="集群指令控制")
-        ttk.Label(self.tab_command, text="待添加...").pack(pady=20)
-
-        self.tab_waypoint = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_waypoint, text="航点设计工具")
-        ttk.Label(self.tab_waypoint, text="待添加...").pack(pady=20)
-
+        # 只保留调试标签页
         self.tab_debug = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_debug, text="集群调试工具")
         self.setup_debug_tab()
@@ -344,25 +259,6 @@ class SwarmGCSApp:
         scrollbar.pack(side='right', fill='y')
         self.tree.pack(fill='both', expand=True, padx=5, pady=5)
 
-        # 3. 远程文件读取 (SD卡)
-        ftp_frame = ttk.LabelFrame(self.tab_debug, text="远程文件读取 (SD卡)")
-        ftp_frame.pack(fill='x', padx=5, pady=5)
-        
-        read_frame = ttk.Frame(ftp_frame)
-        read_frame.pack(fill='x', padx=5, pady=5)
-        
-        ttk.Label(read_frame, text="远程文件名:").pack(side='left')
-        self.entry_remote_filename = ttk.Entry(read_frame, width=20)
-        self.entry_remote_filename.pack(side='left', padx=5)
-        self.entry_remote_filename.insert(0, "UAVID.txt") # 默认读取根目录
-        
-        ttk.Label(read_frame, text="目标无人机:").pack(side='left', padx=5)
-        self.drone_select = ttk.Combobox(read_frame, values=["全部"], state="readonly", width=10)
-        self.drone_select.set("全部")
-        self.drone_select.pack(side='left', padx=5)
-        
-        ttk.Button(read_frame, text="发送读取指令 (FTP)", command=self.start_remote_read_ftp).pack(side='left', padx=5)
-        ttk.Button(read_frame, text="发送自定义指令 (UserCmd)", command=self.start_remote_read_custom).pack(side='left', padx=5)
 
         # 4. 自动任务指令
         auto_task_frame = ttk.LabelFrame(self.tab_debug, text="自动任务指令")
@@ -378,12 +274,6 @@ class SwarmGCSApp:
 
         ttk.Button(auto_task_input_frame, text="自动起飞", command=self.start_auto_takeoff).pack(side='left', padx=5)
         
-        # MultiSync 自动飞行（延迟）
-        ttk.Label(auto_task_input_frame, text="MultiSync 延迟 (秒):").pack(side='left', padx=10)
-        self.entry_multisync_delay = ttk.Entry(auto_task_input_frame, width=8)
-        self.entry_multisync_delay.pack(side='left', padx=5)
-        self.entry_multisync_delay.insert(0, "5")
-        ttk.Button(auto_task_input_frame, text="自动飞行（MultiSync）", command=self.start_multisync_auto).pack(side='left', padx=5)
 
         # 5. 指令发送功能
         cmd_frame = ttk.LabelFrame(self.tab_debug, text="指令发送功能 (Mavlink)")
@@ -391,6 +281,11 @@ class SwarmGCSApp:
         
         cmd_input_frame = ttk.Frame(cmd_frame)
         cmd_input_frame.pack(fill='x', padx=5, pady=5)
+        
+        ttk.Label(cmd_input_frame, text="目标无人机:").pack(side='left', padx=5)
+        self.drone_select = ttk.Combobox(cmd_input_frame, values=["全部"], state="readonly", width=8)
+        self.drone_select.set("全部")
+        self.drone_select.pack(side='left', padx=5)
         
         ttk.Label(cmd_input_frame, text="输入指令:").pack(side='left')
         self.entry_command = ttk.Entry(cmd_input_frame, width=40)
@@ -457,31 +352,19 @@ class SwarmGCSApp:
         def register_drone(sysid, drone):
             self.drones[sysid] = drone
 
-        def parse_uavid(content):
-            line = content.strip().splitlines()[0] if content.strip() else ""
-            if not line: return None, None
-            match = re.match(r"^(.*\S)\s+(\d+)$", line)
-            return (match.group(1), match.group(2)) if match else (line, None)
 
         def _connect_and_post_process(sysid, conn_str):
             if sysid in self.drones and self.drones[sysid].connected:
-                return sysid, self.drones[sysid], True, None, None
+                return sysid, self.drones[sysid], True
             
             log_async(f"正在连接无人机 {sysid} ({conn_str})...")
             drone = DroneInstance(sysid, conn_str)
             if not drone.connect():
                 log_async(f"无人机 {sysid} 连接失败或未收到心跳。")
-                return sysid, None, False, None, None
+                return sysid, None, False
 
             log_async(f"无人机 {sysid} 连接成功。")
-            group_name, group_no = None, None
-            if HAS_FTP and drone.ftp:
-                try:
-                    content = ftp_read_file(drone, sysid, "UAVID.txt", log_async)
-                    group_name, group_no = parse_uavid(content)
-                except Exception as e:
-                    log_async(f"[FTP] 无人机 {sysid} 读取 UAVID.txt 失败: {e}")
-            return sysid, drone, True, group_name, group_no
+            return sysid, drone, True
 
         def worker(max_workers=10):
             success_count = 0
@@ -489,89 +372,17 @@ class SwarmGCSApp:
                 futures = {executor.submit(_connect_and_post_process, sysid, conn_str) for sysid, conn_str in self.drone_configs.items()}
 
                 for future in concurrent.futures.as_completed(futures):
-                    sysid, drone, connected, group_name, group_no = future.result()
+                    sysid, drone, connected = future.result()
                     if connected and drone:
                         success_count += 1
                         self.root.after(0, register_drone, sysid, drone)
-                        if group_name: drone.data["group_name"] = group_name
-                        if group_no: drone.data["group_no"] = group_no
             
             log_async(f"{success_count}台无人机已成功连接")
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def start_remote_read_ftp(self):
-        if not HAS_FTP:
-            self.log("错误: 未检测到 pymavlink.mavftp 模块，FTP功能不可用。")
-            return
-            
-        target = self.drone_select.get()
-        filename = self.entry_remote_filename.get()
-        
-        targets = []
-        if target == "全部":
-            targets = list(self.drones.keys())
-        else:
-            try:
-                targets = [int(target)]
-            except:
-                pass
-        
-        if not targets:
-            self.log("未选择有效的已连接无人机。")
-            return
 
-        threading.Thread(target=self._remote_read_ftp_thread, args=(targets, filename)).start()
 
-    def _remote_read_ftp_thread(self, targets, filename):
-        for sysid in targets:
-            drone = self.drones.get(sysid)
-            if not drone or not drone.connected or not drone.ftp:
-                self.log(f"[FTP] 无人机 {sysid} 未连接或FTP未初始化。")
-                continue
-
-            self.log(f"[FTP] 正在从无人机 {sysid} 读取 {filename} ...")
-            try:
-                with drone.lock:
-                    drone.ftp.cmd_get([filename, "._tmp"])
-                    result = drone.ftp.process_ftp_reply("OpenFileRO", timeout=8)
-                    data = drone.ftp.get_result
-                if data is None:
-                    raise RuntimeError(f"FTP读取失败: {result.return_code}")
-                content = data.decode("utf-8", errors="replace")
-                self.root.after(0, lambda s=sysid, c=content: self.log(f"[无人机 {s} 返回内容]:\n{c}"))
-            except Exception as e:
-                self.root.after(0, lambda s=sysid, e=e: self.log(f"[FTP] 无人机 {s} 读取失败: {e}"))
-
-    def start_remote_read_custom(self):
-        target = self.drone_select.get()
-        targets = []
-        if target == "全部":
-            targets = list(self.drones.keys())
-        else:
-            try:
-                targets = [int(target)]
-            except:
-                pass
-        
-        if not targets:
-            self.log("未选择有效的已连接无人机。")
-            return
-            
-        for sysid in targets:
-            drone = self.drones.get(sysid)
-            if drone and drone.connected:
-                try:
-                    drone.master.mav.command_long_send(
-                        sysid, # target_system
-                        0,     # target_component
-                        31010, # command (MAV_CMD_USER_1)
-                        0,     # confirmation
-                        1, 0, 0, 0, 0, 0, 0 # params
-                    )
-                    self.log(f"[CMD] 已向无人机 {sysid} 发送自定义读取指令 (USER_1)。")
-                except Exception as e:
-                    self.log(f"发送指令失败: {e}")
 
     def start_auto_takeoff(self):
         try:
@@ -714,75 +525,6 @@ class SwarmGCSApp:
         self.running = False
         self.root.destroy()
     
-    def start_multisync_auto(self):
-        # 目标无人机选择
-        target = self.drone_select.get()
-        targets = {}
-        if target == "全部":
-            targets = self.drones
-        else:
-            try:
-                sysid = int(target)
-                if sysid in self.drones:
-                    targets = {sysid: self.drones[sysid]}
-            except (ValueError, KeyError):
-                pass
-        if not targets:
-            self.log("未选择有效的已连接无人机。")
-            return
-        # 读取延迟
-        try:
-            delay_s = float(self.entry_multisync_delay.get())
-        except:
-            self.log("延迟参数错误，应为数字（秒）。")
-            return
-        for sysid, drone in targets.items():
-            if not drone.connected:
-                continue
-            try:
-                mode_map = drone.master.mode_mapping()
-                mode_id = 31
-                if mode_map and "MULTISYNC" in mode_map:
-                    mode_id = mode_map["MULTISYNC"]
-                drone.master.set_mode(mode_id)
-                self.log(f"无人机 {sysid}: 已发送 MultiSync 模式切换 (mode {mode_id})。")
-            except Exception as e:
-                self.log(f"无人机 {sysid} 模式切换失败: {e}")
-        for sysid, drone in targets.items():
-            if not drone.connected:
-                continue
-            try:
-                drone.master.mav.command_long_send(
-                    sysid,
-                    0,
-                    31010,  # MAV_CMD_USER_1
-                    0,
-                    delay_s, 0, 0, 0,
-                    0, 0, 0
-                )
-                self.log(f"[CMD] 已向无人机 {sysid} 发送 MultiSync 启动命令，延迟 {delay_s} 秒。")
-            except Exception as e:
-                self.log(f"无人机 {sysid} MultiSync 启动命令失败: {e}")
-        def arm_after_delay(sysid, drone, delay_s):
-            wait_s = max(delay_s - 1.0, 0.0)
-            if wait_s > 0:
-                self.log(f"无人机 {sysid}: 将在 {wait_s:.1f} 秒后尝试解锁。")
-            time.sleep(wait_s)
-            deadline = time.time() + 10.0
-            while time.time() < deadline:
-                if drone.data.get("armed"):
-                    self.log(f"无人机 {sysid}: 已解锁。")
-                    return
-                try:
-                    drone.master.arducopter_arm()
-                except Exception as e:
-                    self.log(f"无人机 {sysid} 解锁指令失败: {e}")
-                time.sleep(1.0)
-            self.log(f"无人机 {sysid}: 解锁超时，未能进入解锁状态。")
-        for sysid, drone in targets.items():
-            if not drone.connected:
-                continue
-            threading.Thread(target=arm_after_delay, args=(sysid, drone, delay_s), daemon=True).start()
 
 def send_mav_command(drones, cmd_str, log):
     if not cmd_str:
@@ -864,13 +606,11 @@ def run_debug_mode(args):
     if not found_path:
         log("错误: 未找到 waypack.txt 文件。")
         return 1
-    if args.autolink or args.readfile or args.mavcmd:
+    if args.autolink or args.mavcmd:
         log(f"已从 {found_path} 加载默认配置。")
     drones = {}
-    if args.autolink or args.readfile or args.mavcmd:
+    if args.autolink or args.mavcmd:
         drones = connect_drones(configs, log)
-    if args.readfile:
-        read_files_via_ftp(drones, args.readfile, log)
     if args.mavcmd:
         # 等待几秒确保所有无人机状态稳定
         log("等待2秒以确保连接稳定...")
@@ -958,7 +698,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--autolink", action="store_true")
-    parser.add_argument("--readfile", type=str)
     parser.add_argument("--mavcmd", type=str, help="向所有无人机发送MAVLink指令 (例如 'mode guided', 'takeoff 20')")
     parser.add_argument("--autotakeoff", type=float, help="连接后自动起飞到指定高度 (米)")
 
@@ -972,14 +711,10 @@ def main():
     app = SwarmGCSApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
 
-    if args.autolink or args.readfile or args.mavcmd:
+    if args.autolink or args.mavcmd:
         def auto_connect():
             app.load_default_config()
             app.connect_all()
-            if args.readfile:
-                app.entry_remote_filename.delete(0, tk.END)
-                app.entry_remote_filename.insert(0, args.readfile)
-                root.after(1500, app.start_remote_read_ftp)
             if args.mavcmd:
                 app.entry_command.delete(0, tk.END)
                 app.entry_command.insert(0, args.mavcmd)
